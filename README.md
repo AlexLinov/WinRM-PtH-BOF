@@ -57,6 +57,7 @@ winrm_pth <target> "<command>" DOMAIN\username <NT_HASH> [-t milliseconds] [-P p
 
 Example:
 
+<img width="1141" height="390" alt="image" src="https://github.com/user-attachments/assets/4033f8d5-032e-4be3-91f7-29b8e60561d8" />
 
 For local accounts, use the target computer name instead of the domain, such as `SERVER01\Administrator`.
 
