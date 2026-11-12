@@ -73,6 +73,17 @@ Commands execute remotely through `cmd.exe /c`, with output returned to the agen
 
 WinHTTP automatic authentication and redirects are disabled for each request to avoid unintended credential use.
 
+## Roadmap
+
+### [ ] PowerShell Remoting Fallback (PSRP)
+
+- [ ] Automatically fall back to PowerShell when a verified `w:AccessDenied` SOAP fault occurs.
+- [ ] Reuse existing NTLM authentication, signing/sealing, and WSMan transport.
+- [ ] Implement PSRP runspace, pipeline execution, output handling, and cleanup.
+- [ ] Preserve existing `cmd.exe /c` command behavior during fallback.
+- [ ] Display which backend (CMD or PowerShell) executed the command.
+- [ ] Prevent fallback on authentication (401), signature validation, or connection failures.
+
 ## References
 
 - [MS-NLMP: NT LAN Manager Authentication](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/)
