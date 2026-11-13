@@ -75,7 +75,7 @@ WinHTTP automatic authentication and redirects are disabled for each request to 
 
 ## Roadmap
 
-### [ ] PowerShell Remoting Fallback (PSRP)
+###  PowerShell Remoting Fallback (PSRP)
 
 - [ ] Automatically fall back to PowerShell when a verified `w:AccessDenied` SOAP fault occurs.
 - [ ] Reuse existing NTLM authentication, signing/sealing, and WSMan transport.
