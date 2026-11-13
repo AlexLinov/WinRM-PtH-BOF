@@ -10,7 +10,7 @@ var cmd_winrm_pth = ax.create_command(
 );
 cmd_winrm_pth.addArgString("target", true, "Target hostname or IP address");
 cmd_winrm_pth.addArgString("cmd", true, "Command to execute through cmd.exe /c");
-cmd_winrm_pth.addArgString("credentials", true, "DOMAIN\\username or username");
+cmd_winrm_pth.addArgString("username", true, "DOMAIN\\username or username");
 cmd_winrm_pth.addArgString("hash", true, "NT hash (32 hexadecimal characters)");
 cmd_winrm_pth.addArgFlagInt("-t", "timeout", false, "Timeout in milliseconds (default: 15000)");
 cmd_winrm_pth.addArgFlagInt("-P", "port", false, "WinRM HTTP port (default: 5985)");
@@ -18,7 +18,7 @@ cmd_winrm_pth.addArgFlagInt("-P", "port", false, "WinRM HTTP port (default: 5985
 cmd_winrm_pth.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     let target = String(parsed_json["target"] || "").trim();
     let command = String(parsed_json["cmd"] || "");
-    let credentials = String(parsed_json["credentials"] || "");
+    let credentials = String(parsed_json["username"] || "");
     let hash = String(parsed_json["hash"] || "");
     let timeout = parsed_json["timeout"];
     let port = parsed_json["port"];
@@ -42,12 +42,12 @@ cmd_winrm_pth.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     if (separator >= 0) {
         if (separator === 0 || separator === credentials.length - 1 ||
             credentials.indexOf("\\", separator + 1) >= 0)
-            throw new Error("Credentials must contain exactly one backslash: DOMAIN\\username");
+            throw new Error("Invalid username format: use DOMAIN\\username or username");
         domain = credentials.substring(0, separator);
         username = credentials.substring(separator + 1);
     }
     if (!username)
-        throw new Error("Credentials must be DOMAIN\\username or username");
+        throw new Error("Username must be DOMAIN\\username or username");
 
     let parameters = ax.bof_pack(
         "wstr,wstr,wstr,wstr,wstr,int,int",
