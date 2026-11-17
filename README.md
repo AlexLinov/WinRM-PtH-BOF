@@ -63,6 +63,11 @@ For local accounts, use the target computer name instead of the domain, such as 
 
 The command shown above uses the optional AdaptixC2 integration. Other compatible C2 frameworks can execute the compiled BOF using their supported argument-packing and execution mechanisms.
 
+### Mythic (Xenon Agent)
+
+<img width="1387" height="784" alt="image" src="https://github.com/user-attachments/assets/66572236-8e72-4569-a88e-f56a18072af7" />
+Arguments are passed as typed values using `wchar:` for strings and `int32:` for integers. The domain and username are separate fields.
+
 ## How It Works
 
 The BOF performs the NTLMv2 authentication exchange using the supplied NT hash, then derives the session keys needed to protect WinRM communication.
@@ -75,14 +80,20 @@ WinHTTP automatic authentication and redirects are disabled for each request to 
 
 ## Roadmap
 
-###  PowerShell Remoting Fallback (PSRP)
+### PowerShell Remoting Fallback (PSRP)
 
-- [ ] Automatically fall back to PowerShell when a verified `w:AccessDenied` SOAP fault occurs.
-- [ ] Reuse existing NTLM authentication, signing/sealing, and WSMan transport.
-- [ ] Implement PSRP runspace, pipeline execution, output handling, and cleanup.
-- [ ] Preserve existing `cmd.exe /c` command behavior during fallback.
-- [ ] Display which backend (CMD or PowerShell) executed the command.
-- [ ] Prevent fallback on authentication (401), signature validation, or connection failures.
+- [x] Automatically fall back to PowerShell when a verified `w:AccessDenied` SOAP fault occurs.
+- [x] Reuse existing NTLM authentication, signing/sealing, and WSMan transport.
+- [x] Implement PSRP runspace, pipeline execution, output handling, and cleanup.
+- [x] Preserve existing `cmd.exe /c` command behavior during fallback.
+- [x] Display which backend (CMD or PowerShell) executed the command.
+- [x] Prevent fallback on authentication (401), signature validation, or connection failures.
+
+### Cross-C2 Portability
+
+- [x] Use standard BeaconData API for argument parsing across all COFF loaders.
+- [x] Retain raw text fallback for AdaptixC2 AxScript integration.
+- [x] Replace custom argument parser with framework-provided BeaconData functions.
 
 ## References
 
