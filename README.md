@@ -74,9 +74,11 @@ The BOF performs the NTLMv2 authentication exchange using the supplied NT hash, 
 
 WSMan requests are encrypted and signed using NTLM session security. Responses are decrypted and verified before processing.
 
-Commands execute remotely through `cmd.exe /c`, with output returned to the agent. Response buffering is limited to 256 KiB.
+Commands first attempt to execute through the standard text shell (`cmd.exe /c`). If the target returns a verified `AccessDenied` SOAP fault for the cmd shell, the BOF automatically retries using the PowerShell Remoting Protocol (PSRP) over the same authenticated connection. The PSRP path opens a runspace, submits the command as a pipeline, and parses the CLIXML output stream. No re-authentication is needed since the NTLM session keys carry over from the initial exchange.
 
-WinHTTP automatic authentication and redirects are disabled for each request to avoid unintended credential use.
+The output indicates which backend ran the command (`cmd` or `PowerShell`). Fallback only triggers on a verified access-denied fault. Authentication failures (401), signature validation errors, and transport failures are reported immediately without retry.
+
+Response buffering is limited to 256 KiB. WinHTTP automatic authentication and redirects are disabled for each request to avoid unintended credential use.
 
 ## Roadmap
 
